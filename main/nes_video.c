@@ -281,12 +281,12 @@ static void mtext(uint16_t *fb, int slice, int x0, int y0, const char *txt, uint
     }
 }
 
-// 选中卡标题:1.4x 放大(16px 点阵 -> 22px,最近邻取样)+ 黑描边。
-// 黑描边是为了波峰亮起时白字仍可读;不用插值,缩放后仍是硬像素,与
-// 颗粒波纹同一套 8-bit 像素语言。最长 8 字名 8*22=176px,卡宽内放得下。
-static void mtext_big(uint16_t *fb, int slice, int cx_c, int cy_c,
-                      const char *txt, uint16_t fg, uint16_t ol) {
-    const int cw = 22;   // 每字盒宽 = 盒高(字形方形)
+// 选中卡标题:原大 16px + 黑描边。
+// 黑描边是为了波峰亮起时白字仍可读;走最近邻缩放器(cw=16 即 1:1 取样),
+// 描边逻辑与放大版共用同一份代码。
+static void mtext_outlined(uint16_t *fb, int slice, int cx_c, int cy_c,
+                           const char *txt, uint16_t fg, uint16_t ol) {
+    const int cw = 16;   // 每字盒宽 = 盒高(字形方形)
     int w = utf8_len(txt) * cw;
     int x0 = cx_c - w / 2;
     int y0 = cy_c - cw / 2;
@@ -494,9 +494,9 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
                     draw_card_plain(fb, slice, NES_FB_W / 2, cy,
                                     MENU_PEEK_W, MENU_PEEK_H, 8, COL_BG_N3, COL_BD_N3);
                 int tw = utf8_len(names[i]) * 16;
-                if (depth == 0) {   // 选中卡标题:1.4x 放大 + 黑描边
-                    mtext_big(fb, slice, NES_FB_W / 2, cy,
-                              names[i], COL_TEXT_S, 0x0000);
+                if (depth == 0) {   // 选中卡标题:原大 16px + 黑描边
+                    mtext_outlined(fb, slice, NES_FB_W / 2, cy,
+                                   names[i], COL_TEXT_S, 0x0000);
                 } else {
                     mtext(fb, slice, (NES_FB_W - tw) / 2, cy - 8, names[i],
                           depth == 1 ? COL_TEXT_N1 :
