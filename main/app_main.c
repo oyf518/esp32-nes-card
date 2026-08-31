@@ -27,6 +27,7 @@
 #include "nes_video.h"
 #include "ble_pad.h"
 #include "rom_menu.h"
+#include "splash.h"
 
 static const char *TAG = "app";
 
@@ -120,8 +121,9 @@ static void emu_task(void *arg) {
 }
 
 void app_main(void) {
-    // 显示:SPI 面板 + 背光
+    // 显示:SPI 面板 + 背光。开机画面淡入->停留->淡出,随后恢复正常背光
     ESP_ERROR_CHECK(bsp_display_init());
+    splash_show(1500);
     bsp_display_backlight(80);
 
     // 音频:22050Hz 16bit 单声道,bsp_audio_set_format 内部会先 close 再 open,直接调

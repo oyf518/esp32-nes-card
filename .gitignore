@@ -9,6 +9,8 @@ dependencies.lock.bak
 *.nes
 *.bin
 *.img
+# 例外:开机画面位图(tools/gen_splash.py 从 assets/splash_src.png 生成)
+!main/splash.bin
 
 # Python
 __pycache__/
