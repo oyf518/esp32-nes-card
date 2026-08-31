@@ -46,3 +46,7 @@ void nes_video_menu_draw(const char *const *names, int count, int sel);
 // 菜单覆盖了全屏(含游戏区的上下黑边);进游戏前调用,把 y<40 / y>=280
 // 清回黑色,避免菜单残留。
 void nes_video_clear_edges(void);
+
+// 借出半帧缓冲 s_fb 作通用推屏暂存(开机画面逐带推屏用),容量 240x120 像素。
+// 仅限 nes_video_init 之前或菜单/游戏未在推屏时使用,借出方不得越界写。
+uint16_t *nes_video_scratch(void);

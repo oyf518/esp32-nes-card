@@ -16,6 +16,7 @@
 #include "bsp_button.h"
 #include "bsp_battery.h"
 #include "nvs_flash.h"
+#include "esp_heap_caps.h"
 
 // 同 osd_esp.c:nofrendo 头与 stdbool 冲突,先引 ESP 头再 undef 三件套
 
@@ -64,6 +65,8 @@ static void emu_task(void *arg) {
     // ROM 库 + 选择菜单(机身三键 / BLE 手柄,菜单内音量键只用于选择)
     if (rombank_init() <= 0) {
         ESP_LOGE(TAG, "ROM 库为空:请烧录 rompack.bin 到 0x190000");
+        // 背光点亮到错误状态(残显开屏画面),否则一直黑屏像死机
+        bsp_display_backlight(80);
         vTaskDelete(NULL);
     }
 
@@ -83,6 +86,10 @@ static void emu_task(void *arg) {
     // 菜单 <-> 游戏 热切换循环:游戏内长按 OK -> nes_poweroff() -> nes_emulate
     // 返回 -> 销毁本局 -> 回菜单。全程不走重启,BLE 手柄连接原封不动。
     for (;;) {
+        ESP_LOGI(TAG, "heap: free=%lu largest8bit=%lu min_free=%lu",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                 (unsigned long)esp_get_minimum_free_heap_size());
         int sel = rom_menu_run();
         // 菜单 BGM 把 I2S 切到了 16kHz,进游戏前恢复 NES 音频格式
         ESP_ERROR_CHECK(bsp_audio_set_format(22050, 16, 1));
@@ -121,15 +128,20 @@ static void emu_task(void *arg) {
 }
 
 void app_main(void) {
-    // 显示:SPI 面板 + 背光。开机画面淡入->停留->淡出,随后恢复正常背光
+    // 显示:SPI 面板 + 背光。开机画面淡入->停留->淡出;背光保持熄灭,
+    // 直到菜单第一帧完整上屏才点亮(nes_video_menu_draw)——过早点亮的话,
+    // 亮起来的瞬间 GRAM 里还是开屏画面,菜单要再过一阵才画出来。
     ESP_ERROR_CHECK(bsp_display_init());
-    splash_show(1500);
-    bsp_display_backlight(80);
 
-    // 音频:22050Hz 16bit 单声道,bsp_audio_set_format 内部会先 close 再 open,直接调
+    // 音频:先于开屏初始化,开屏音效要跟淡入一起响;音量先给个能听见的值,
+    // osd_volume_init 稍后从 NVS 恢复用户设置
     ESP_ERROR_CHECK(bsp_audio_init());
-    ESP_ERROR_CHECK(bsp_audio_set_format(22050, 16, 1));
     bsp_audio_set_volume(70);
+
+    splash_show(4000);   // 期间播开屏音效(音效任务把 codec 切到了 16kHz)
+
+    // 恢复 NES 音频格式:22050Hz 16bit 单声道,bsp_audio_set_format 内部会先 close 再 open
+    ESP_ERROR_CHECK(bsp_audio_set_format(22050, 16, 1));
 
     // 按键:回调只接长按退出;方向/A 键在 osd_getinput 里轮询 ADC 电压
     ESP_ERROR_CHECK(bsp_button_init(on_button, NULL));
@@ -166,6 +178,10 @@ void app_main(void) {
         return;
     }
 
-    // 模拟器任务:nes_emulate 调用链较深,给足栈;优先级高于 idle 即可
-    xTaskCreate(emu_task, "nes_emu", 8192, NULL, 5, NULL);
+    // 模拟器任务:nes_emulate 调用链较深,给足栈;优先级高于 idle 即可。
+    // 必须检查返回值:堆不足时创建失败若不报错,设备会"静默黑屏"毫无线索。
+    if (xTaskCreate(emu_task, "nes_emu", 8192, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "模拟任务创建失败(内存不足)");
+        return;
+    }
 }

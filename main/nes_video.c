@@ -151,19 +151,22 @@ void nes_video_blit(const bitmap_t *bmp) {
 
 // ---------------------------------------------------------------------------
 // 菜单渲染:现代扁平风,全屏 240x320(推屏 3 片:120+120+80 行)。
-// 纯色深底,纵向卡片轮转(cover-flow):选中卡片居中放大(圆角 + 纯色橙描边),
+// 纯色深底,纵向卡片轮转(cover-flow):选中卡片居中放大(圆角 + 橙描边 +
+// 颗粒波纹动效底:正弦环纹外扩 + BGM 节拍脉冲 + 逐像素颗粒,4 档色阶量化),
 // 上下各三级邻近卡片逐级缩小压暗(最远处只露出一截),切换选择时整列滑动
 // 过渡(指数平滑)。顶部状态栏:BLE 图标(连接=橙 / 未连接=灰)+ 标题
 // 「小小游戏机」+ 电池;底部进度条指示选中项在库中的位置。上下各留 10px 边距。
 // 卡片绘制被裁剪在状态栏分隔线与进度条之间,滑动时也不会盖住栏。
 // 16x16 点阵(menufont.h,tools/gen_menufont.py 生成,字符集受 romlist 限制,
 // 新增 UI 文案只能用字库里已有的字,否则要先改 gen_menufont.py 的 UI_TEXT)。
-// rom_menu_run 每帧整页重画(约 30fps,受推屏 DMA 限速),动效按墙钟相位计算。
+// rom_menu_run 每帧整页重画(约 30fps,受推屏 DMA 限速),动效相位取自
+// BGM 播放起点(music_pos_ms),节拍与音乐同源。
 // ---------------------------------------------------------------------------
 #include "menufont.h"
 #include "esp_timer.h"
 #include "bsp_battery.h"
 #include "ble_pad.h"
+#include "music.h"   // music_pos_ms:菜单动效跟 BGM 节拍对齐
 
 #define MENU_LCD_H      320        // 菜单全屏高
 #define MENU_FOCUS_CY   168        // 选中卡片中心 y
@@ -189,7 +192,10 @@ void nes_video_blit(const bitmap_t *bmp) {
 #define COL_DIV      SWAP565(0x4229) // 分隔线:rgb(70,70,76)
 #define COL_ACCENT   SWAP565(0xFCE1) // 点缀色琥珀橙:#FF9F0A
 #define COL_TEXT_S   0xFFFF          // 选中卡片文字:白(对称值无需交换)
-#define COL_CARD_F   SWAP565(0x3186) // 选中卡底:rgb(48,48,54)
+#define COL_CARD_F   SWAP565(0x3186) // 选中卡底:rgb(48,48,54),也是波纹色阶第 0 档
+#define COL_WAVE1    SWAP565(0x1448) // 波纹色阶 1:rgb(74,72,70)
+#define COL_WAVE2    SWAP565(0x1D08) // 波纹色阶 2:rgb(110,96,64) 开始偏暖
+#define COL_WAVE3    SWAP565(0x2786) // 波纹色阶 3:rgb(150,112,52) 波峰,琥珀亮
 #define COL_TEXT_N1  SWAP565(0xC618) // ±1 文字:浅灰
 #define COL_BG_N1    SWAP565(0x2104) // ±1 卡底:rgb(34,34,38)
 #define COL_BD_N1    SWAP565(0x4A4A) // ±1 卡描边:rgb(74,74,80)
@@ -275,20 +281,89 @@ static void mtext(uint16_t *fb, int slice, int x0, int y0, const char *txt, uint
     }
 }
 
-// 选中卡片:纯色底 + 2px 主色描边(圆角)
-static void draw_card_focus(uint16_t *fb, int slice, int cx, int cy) {
+// 选中卡标题:1.4x 放大(16px 点阵 -> 22px,最近邻取样)+ 黑描边。
+// 黑描边是为了波峰亮起时白字仍可读;不用插值,缩放后仍是硬像素,与
+// 颗粒波纹同一套 8-bit 像素语言。最长 8 字名 8*22=176px,卡宽内放得下。
+static void mtext_big(uint16_t *fb, int slice, int cx_c, int cy_c,
+                      const char *txt, uint16_t fg, uint16_t ol) {
+    const int cw = 22;   // 每字盒宽 = 盒高(字形方形)
+    int w = utf8_len(txt) * cw;
+    int x0 = cx_c - w / 2;
+    int y0 = cy_c - cw / 2;
+    int ci = 0;   // 第几个字符(占 cw 宽的盒)
+    for (const char *p = txt; *p; ) {
+        uint32_t ucs = (uint8_t)*p;
+        int len = 1;
+        if (ucs >= 0xE0) {
+            ucs = ((ucs & 0x0F) << 12) | (((uint8_t)p[1] & 0x3F) << 6) |
+                  ((uint8_t)p[2] & 0x3F);
+            len = 3;
+        }
+        p += len;
+        int gi = menu_glyph_find(ucs);
+        if (gi < 0) { ci++; continue; }
+        int bx = x0 + ci++ * cw;
+        for (int pass = 0; pass < 2; pass++) {          // 先描边圈,后笔画
+            for (int dy = 0; dy < cw; dy++) {
+                uint16_t bits = k_menu_glyphs[gi].glyph[dy * 16 / cw];
+                for (int dx = 0; dx < cw; dx++) {
+                    int sx = dx * 16 / cw;
+                    if (!(bits & (0x8000 >> sx))) continue;
+                    if (pass == 0) {
+                        for (int oy = -1; oy <= 1; oy++)
+                            for (int ox = -1; ox <= 1; ox++)
+                                mput(fb, slice, y0 + dy + oy, bx + dx + ox, ol);
+                    } else {
+                        mput(fb, slice, y0 + dy, bx + dx, fg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 选中卡片:颗粒波纹底 + 2px 主色描边(圆角)。
+// 动效三件套(见区块头注释):正弦环纹从卡中心向外扩散 + BGM 节拍脉冲
+// (100 BPM,拍点最亮随后衰减)+ 逐像素颗粒抖动(每拍换样),最后压成
+// 4 档色阶 —— 颗粒感和"波峰亮一点"都来自色阶量化。距离用八边形近似
+// (max + min/2)代替开方,全整数运算,C3 无 FPU 也跑得动。
+#define BGM_BEAT_MS 600   // 菜单 BGM 100 BPM(menu_tune.h),动效节拍跟它对齐
+static const uint8_t k_sin64[64] = {   // 0..255 正弦,一个周期
+    128, 140, 153, 165, 177, 188, 199, 208, 218, 226, 234, 240, 245, 250, 252, 254,
+    255, 254, 252, 250, 245, 240, 234, 226, 218, 208, 199, 188, 177, 165, 153, 140,
+    128, 116, 103,  91,  79,  68,  57,  48,  38,  30,  22,  16,  11,   6,   4,   2,
+      1,   2,   4,   6,  11,  16,  22,  30,  38,  48,  57,  68,  79,  91, 103, 116,
+};
+
+static void draw_card_focus(uint16_t *fb, int slice, int cx, int cy, int env) {
+    static const uint16_t ramp[4] = { COL_CARD_F, COL_WAVE1, COL_WAVE2, COL_WAVE3 };
     const int w = MENU_CARD_W, h = MENU_CARD_H, R = MENU_CARD_R;
     const int x0 = cx - w / 2, y0 = cy - h / 2;
+    const uint32_t pos = music_pos_ms();                 // 曲内时间,BGM 停时为 0
+    const int bstep = pos / BGM_BEAT_MS;                 // 拍序号:颗粒每拍换样
+    const int wphase = (int)(pos * 6 / 100);             // 环纹相位:~30px/s 外扩
+
     for (int dy = 0; dy < h; dy++) {
         int ins = rounded_inset(dy, h, R);
-        if (dy < 2 || dy >= h - 2) {
+        int ady = dy - h / 2;
+        if (dy < 2 || dy >= h - 2) {                     // 上下描边行
             for (int x = ins; x < w - ins; x++) mput(fb, slice, y0 + dy, x0 + x, COL_ACCENT);
-        } else {
-            for (int t = 0; t < 2; t++) {
-                mput(fb, slice, y0 + dy, x0 + ins + t, COL_ACCENT);
-                mput(fb, slice, y0 + dy, x0 + w - 1 - ins - t, COL_ACCENT);
+            continue;
+        }
+        for (int x = ins; x < w - ins; x++) {
+            uint16_t c = COL_ACCENT;                     // 左右描边列
+            if (x >= ins + 2 && x < w - ins - 2) {       // 中间:颗粒波纹
+                int adx = x - w / 2;
+                int ax = adx < 0 ? -adx : adx, ay = ady < 0 ? -ady : ady;
+                int d = (ax > ay ? ax : ay) + ((ax > ay ? ay : ax) >> 1);
+                int wave = k_sin64[(d * 2 - wphase) & 63];       // 0..255
+                int lvl = (wave * wave >> 8) + (env >> 1);       // 环纹叠节拍脉冲
+                uint32_t hsh = (uint32_t)(adx * adx * 31 ^ ady * 57 ^ bstep * 97);
+                lvl += (int)(hsh & 31) - 16;                     // 颗粒抖动
+                if (lvl < 0) lvl = 0; else if (lvl > 255) lvl = 255;
+                c = ramp[lvl >> 6];                              // 压成 4 档色阶
             }
-            for (int x = ins + 2; x < w - ins - 2; x++) mput(fb, slice, y0 + dy, x0 + x, COL_CARD_F);
+            mput(fb, slice, y0 + dy, x0 + x, c);
         }
     }
 }
@@ -373,6 +448,11 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
         s_soc = bsp_battery_soc();
     }
 
+    // BGM 节拍包络(0..255,拍点最大,平方衰减):卡底波纹与标题呼吸共用
+    uint32_t bpos = music_pos_ms();
+    int benv_raw = 255 - (int)(bpos % BGM_BEAT_MS) * 255 / BGM_BEAT_MS;
+    int benv = benv_raw * benv_raw >> 8;
+
     for (int slice = 0; slice < 3; slice++) {
         if (!wait_trans_done()) return;
         int y0 = slice * NES_FB_SLICE;
@@ -403,7 +483,7 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
                          depth == 1 ? MENU_NEAR_H :
                          depth == 2 ? MENU_FAR_H : MENU_PEEK_H;
                 if (cy + ch / 2 < MENU_CLIP_Y || cy - ch / 2 > MENU_CLIP_B) continue;
-                if (depth == 0) draw_card_focus(fb, slice, NES_FB_W / 2, cy);
+                if (depth == 0) draw_card_focus(fb, slice, NES_FB_W / 2, cy, benv);
                 else if (depth == 1)
                     draw_card_plain(fb, slice, NES_FB_W / 2, cy,
                                     MENU_NEAR_W, MENU_NEAR_H, 10, COL_BG_N1, COL_BD_N1);
@@ -414,10 +494,14 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
                     draw_card_plain(fb, slice, NES_FB_W / 2, cy,
                                     MENU_PEEK_W, MENU_PEEK_H, 8, COL_BG_N3, COL_BD_N3);
                 int tw = utf8_len(names[i]) * 16;
-                mtext(fb, slice, (NES_FB_W - tw) / 2, cy - 8, names[i],
-                      depth == 0 ? COL_TEXT_S :
-                      depth == 1 ? COL_TEXT_N1 :
-                      depth == 2 ? COL_TEXT_N2 : COL_TEXT_N3);
+                if (depth == 0) {   // 选中卡标题:1.4x 放大 + 黑描边
+                    mtext_big(fb, slice, NES_FB_W / 2, cy,
+                              names[i], COL_TEXT_S, 0x0000);
+                } else {
+                    mtext(fb, slice, (NES_FB_W - tw) / 2, cy - 8, names[i],
+                          depth == 1 ? COL_TEXT_N1 :
+                          depth == 2 ? COL_TEXT_N2 : COL_TEXT_N3);
+                }
             }
         }
         s_clip_y = 0;
@@ -436,4 +520,15 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
             break;
         }
     }
+
+    // 菜单第一帧完整推上屏后才点亮背光:开机阶段 GRAM 里残留着开屏画面,
+    // 背光在 app_main 里过早点亮会"亮屏仍见开屏";这里保证亮起的瞬间就是菜单。
+    static bool s_menu_lit = false;
+    if (!s_menu_lit) {
+        s_menu_lit = true;
+        bsp_display_backlight(80);
+    }
 }
+
+// 开机画面等借用 s_fb 作推屏暂存,省一块常驻缓冲(见 nes_video.h)
+uint16_t *nes_video_scratch(void) { return s_fb; }

@@ -1,14 +1,17 @@
-// main/music.c —— 菜单 BGM 循环播放器:方波合成播放 tune_t 里的多声部音符表。
+// main/music.c —— 菜单 BGM / 短音效播放器:方波合成播放 tune_t 里的多声部音符表。
 // 25% 占空比仿 NES 脉冲声道;相位用整数累加,避免逐采样浮点(C3 无 FPU)。
-// 移植自 menu_app/main/music.c:去掉音效任务与音量覆盖,改为单曲循环。
+// 移植自 menu_app/main/music.c:去掉音量覆盖;BGM 循环,音效播一遍即停。
 #include "music.h"
 #include "bsp_audio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 
 static const char *TAG = "music";
+
+static uint32_t s_start_ms;   // 本次播放起点(esp_timer 墙钟,动效对拍用)
 
 #define SAMPLE_RATE   16000
 #define CHUNK_SAMPLES 256                 // 每次送 16ms,控制任务栈内缓冲
@@ -18,6 +21,7 @@ static const char *TAG = "music";
 
 static volatile bool s_playing;
 static volatile bool s_stop_req;
+static volatile bool s_loop;   // true=循环(BGM),false=播一遍即停(音效)
 
 // MIDI 音高 -> 整数相位步进(2^32 / 采样率)
 static uint32_t note_step(uint8_t note) {
@@ -56,7 +60,7 @@ static void music_task(void *arg) {
 
     int16_t buf[CHUNK_SAMPLES];
     uint32_t total = ((uint32_t)tune->total_ms + 50) * (SAMPLE_RATE / 1000);
-    while (!s_stop_req) {                 // 循环整曲
+    do {                                  // 循环曲整曲重复,音效只播一遍
         memset(v, 0, sizeof(v));
         for (int i = 0; i < nv; i++) {
             v[i].notes = tune->voices[i];
@@ -88,20 +92,34 @@ static void music_task(void *arg) {
             }
             bsp_audio_write(buf, sizeof(buf));
         }
-    }
+    } while (s_loop && !s_stop_req);
 
     memset(buf, 0, sizeof(buf));          // 尾部送一段静音,防止 codec 停在直流电平
     bsp_audio_write(buf, sizeof(buf));
-    ESP_LOGI(TAG, "BGM 停止");
+    ESP_LOGI(TAG, "播放结束");
     s_playing = false;
     vTaskDelete(NULL);
 }
 
-void music_play_loop(const tune_t *tune) {
+static void music_start(const tune_t *tune, bool loop) {
     if (s_playing || !tune) return;
+    s_loop = loop;
     s_stop_req = false;
+    s_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_playing = true;
     xTaskCreate(music_task, "music", 4096, (void *)tune, 4, NULL);
+}
+
+void music_play_loop(const tune_t *tune) {
+    music_start(tune, true);
+}
+
+void music_play_once(const tune_t *tune) {
+    music_start(tune, false);
+}
+
+uint32_t music_pos_ms(void) {
+    return s_playing ? (uint32_t)(esp_timer_get_time() / 1000) - s_start_ms : 0;
 }
 
 // 请求停止并等待音乐任务退出(通常 <20ms)

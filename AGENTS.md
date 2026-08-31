@@ -44,10 +44,10 @@ python3 tools/gen_splash.py     # 240x320 RGB565 位图 -> main/splash.bin(EMBED
 - **ROM 加载链**：`rom_menu.c` 读 storage 分区的 NESPACK1 格式（目录表 + 4KB 对齐 ROM），`esp_partition_mmap` 零拷贝映射；nofrendo 内核经 `app_main.c` 的 `osd_getromdata()` 取数据指针。改 ROM 库格式时，`rom_menu.c` 的 `rom_ent_t`（64B 槽位）与 `tools/rompack.py` 的目录项布局必须严格同步。
 - **头文件包含顺序**：`osd_esp.c`/`app_main.c` 必须先引 ESP-IDF/标准头，再 `#undef` bool/true/false，最后才引 nofrendo 头（nofrtypes.h 是 C89 风格，与 stdbool 冲突）。新建引用 nofrendo 的文件照抄此模式。
 - **热切换**：游戏内长按 OK → `nes_poweroff()` → `nes_emulate()` 返回 → 销毁本局 → 回菜单，全程不走重启，BLE 连接保持。新增游戏内功能时别破坏此循环。
-- **内存**：无 PSRAM，帧缓冲全在 SRAM；推屏按整 240 行索引（`NES_VISIBLE_HEIGHT=224` 会越界，见 `nes_video.c` 注释）。
+- **内存**：无 PSRAM，堆仅 ~137KB，帧缓冲全在 SRAM；推屏按整 240 行索引（`NES_VISIBLE_HEIGHT=224` 会越界，见 `nes_video.c` 注释）。BLE 栈与模拟器共存靠 `sdkconfig.defaults` 里的 NimBLE 内存池瘦身（MSYS/ACL/MAX_ACT 减半），回退会导致游戏加载失败（8.5KB 电池 RAM 分配不出，日志见 `osd: Could not allocate space for battery RAM`）；菜单态堆水位 ~32KB/最大块 24KB，`app_main` 每次进菜单会打 heap 日志便于排查。
 - **编译优化**：模拟器 CPU 密集，全局 `-O2`（`sdkconfig.defaults` 的 `CONFIG_COMPILER_OPTIMIZATION_PERF`），不要改回默认 `-Og`。
 - **双板支持**：`components/bsp` 的引脚/分辨率按 `CONFIG_IDF_TARGET_ESP32` 区分 ESP32-C3(FoloToy-Card) 与 ESP32(M5StickC Plus)，改引脚看 `bsp_pins.h`。
-- **开机画面**：`main/splash.c` 整屏推 EMBED 的 splash.bin，淡入淡出用背光 PWM（逐像素混合一帧 150KB@40MHz SPI 约 25ms，跑不出流畅动画）。换图重跑 `gen_splash.py`，字节序是 MSB-first RGB565（与 nes_video.c 的 SWAP565 约定一致）。
+- **开机画面**：`main/splash.c` 借 `nes_video_scratch()` 逐带推 EMBED 的 splash.bin(整帧直推会因驱动现分配 DMA 中转缓冲失败而下半屏花屏,实测),停留 4s + 开屏音效(`music_play_once`),淡入淡出用背光 PWM;背光点亮由菜单第一帧触发(nes_video_menu_draw),勿在 app_main 提前拉背光。换图重跑 `gen_splash.py`,字节序是 MSB-first RGB565（与 nes_video.c 的 SWAP565 约定一致）。
 - **注释风格**：全项目中文注释、文件头一段说明设计意图，新代码保持一致。
 
 ## 改动验证清单

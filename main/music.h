@@ -1,5 +1,5 @@
-// main/music.h —— 菜单 BGM 循环播放器:方波合成(25% 占空比仿 NES 脉冲声道),
-// 多声部混音经 ES8311 播放,独立任务运行,不阻塞菜单渲染。
+// main/music.h —— 菜单 BGM / 短音效播放器:方波合成(25% 占空比仿 NES 脉冲声道),
+// 多声部混音经 ES8311 播放,独立任务运行,不阻塞调用方。
 // 移植自 menu_app/main/music.c,裁剪为仅循环播放;
 // 音量沿用当前设置(游戏音量由 osd_esp.c 管理,这里不碰)。
 #pragma once
@@ -25,5 +25,13 @@ typedef struct {
 // 内部把 I2S 切到 16kHz/16bit/单声道;停止后调用方负责恢复游戏格式。
 void music_play_loop(const tune_t *tune);
 
+// 播放一遍即停(开屏音效用)。已在播时忽略;内部同样把 I2S 切到
+// 16kHz/16bit/单声道,播完后停在 16kHz,调用方负责恢复所需格式。
+void music_play_once(const tune_t *tune);
+
 // 立即停止播放(未在播则空操作)。阻塞到音乐任务退出,通常 <20ms。
 void music_stop(void);
+
+// 已播时长 ms(自本次播放起点计);未在播返回 0。
+// 菜单动效用它对齐 BGM 节拍(波纹律动与音乐同源,不会各走各的)。
+uint32_t music_pos_ms(void);
