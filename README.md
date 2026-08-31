@@ -1,11 +1,9 @@
 # esp32-nes-card · 名片大小的 FC 游戏机
 
+[简体中文](README.md) | [English](README_EN.md)
+
 把一块 FoloToy AI 卡片(FoloToy-Card,ESP32-C3)刷成 NES/FC 模拟器掌机:
 nofrendo 内核 + ROM 库菜单 + BLE 无线手柄,8MB Flash,全程中文注释。
-
-> ESP32-C3 card-sized NES emulator based on nofrendo, with an on-device
-> ROM library menu and BLE gamepad support. See [构建](#构建) below.
-> (简体中文为主, English summary at the end)
 
 <!-- TODO: 放一张实机照片 / 30 秒演示视频链接 -->
 
@@ -92,13 +90,3 @@ python3 tools/padcal.py    # 浏览器打开 http://127.0.0.1:8788
 
 - 本仓库原创代码(main/、components/bsp/、tools/):[MIT](LICENSE)
 - `components/nofrendo/`:Nofrendo 内核,保留其 [LGPL-2.0](components/nofrendo/LICENSE) 许可与版权声明
-
-## English summary
-
-An ESP32-C3 (RISC-V, no PSRAM) NES emulator firmware: nofrendo core driving a
-240x320 ST7789 SPI panel over a framebuffer blit path, game ROMs served from a
-custom raw-partition ROM library (no filesystem overhead, `mmap`-ed on select),
-BLE HID gamepad with auto reconnect, menu BGM synthesized on-chip. Build with
-ESP-IDF v5.5.x (`idf.py set-target esp32c3 && idf.py build flash`). Pack ROMs
-with `tools/rompack.py` and flash to offset `0x190000`. Bring your own ROMs —
-none are included or distributed here.
