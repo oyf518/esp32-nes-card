@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+# 板级支持包 components/bsp 已随本仓库自带(FoloToy-Card 板,ESP32-C3)
+set(EXTRA_COMPONENT_DIRS components)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(nes)

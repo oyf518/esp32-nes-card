@@ -1,0 +1,12 @@
+# ROM 库清单:每行 "路径|显示名"(路径相对仓库根,显示名最长 15 个汉字)
+# 改完执行:
+#   1) python3 tools/gen_menufont.py    (字库自动跟随清单)
+#   2) cd esp32-nes-card && idf.py build flash         (字库在固件里)
+#   3) python3 tools/rompack.py -o rompack.bin -l tools/romlist.txt
+#      python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodemXXXX write_flash 0x190000 rompack.bin
+#
+# ROM 合法性自担:请使用自制 ROM、免费 homebrew,或你合法拥有实体卡带的转储。
+# 商业 ROM 不受保护地再分发是侵权,请勿把打包好的 rompack.bin 传到网上。
+#
+# 下面这条是仓库自带的零版权测试 ROM(由 tools/gen_test_rom.py 生成):
+tools/test_rom.nes|测试卡

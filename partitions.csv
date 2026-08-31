@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size,     Flags
+# 注:Offset 留空表示紧随上一分区自动对齐。
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x180000,
+# 优化:扩容到尾部全部空闲区(0x190000..0x800000),ROM 库用裸分区方案(见 rom_menu.c)。
+storage,  data, spiffs,  ,        0x570000,

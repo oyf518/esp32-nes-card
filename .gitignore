@@ -1,0 +1,18 @@
+# ESP-IDF 构建产物
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock.bak
+
+# ROM 与固件镜像:任何 .nes 都不进仓库(版权红线),镜像同样
+*.nes
+*.bin
+*.img
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
