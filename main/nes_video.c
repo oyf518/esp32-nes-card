@@ -193,9 +193,9 @@ void nes_video_blit(const bitmap_t *bmp) {
 #define COL_ACCENT   SWAP565(0xFCE1) // 点缀色琥珀橙:#FF9F0A
 #define COL_TEXT_S   0xFFFF          // 选中卡片文字:白(对称值无需交换)
 #define COL_CARD_F   SWAP565(0x3186) // 选中卡底:rgb(48,48,54),也是波纹色阶第 0 档
-#define COL_WAVE1    SWAP565(0x1448) // 波纹色阶 1:rgb(74,72,70)
-#define COL_WAVE2    SWAP565(0x1D08) // 波纹色阶 2:rgb(110,96,64) 开始偏暖
-#define COL_WAVE3    SWAP565(0x2786) // 波纹色阶 3:rgb(150,112,52) 波峰,琥珀亮
+#define COL_WAVE1    SWAP565(0x41E7) // 波纹色阶 1:rgb(64,60,56)
+#define COL_WAVE2    SWAP565(0x5267) // 波纹色阶 2:rgb(80,76,56) 微微偏暖
+#define COL_WAVE3    SWAP565(0x72E6) // 波纹色阶 3:rgb(112,92,48) 波峰,暗琥珀
 #define COL_TEXT_N1  SWAP565(0xC618) // ±1 文字:浅灰
 #define COL_BG_N1    SWAP565(0x2104) // ±1 卡底:rgb(34,34,38)
 #define COL_BD_N1    SWAP565(0x4A4A) // ±1 卡描边:rgb(74,74,80)
