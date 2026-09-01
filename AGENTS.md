@@ -48,7 +48,6 @@ python3 tools/gen_splash.py     # 240x320 RGB565 位图 -> main/splash.bin(EMBED
 - **编译优化**：模拟器 CPU 密集，全局 `-O2`（`sdkconfig.defaults` 的 `CONFIG_COMPILER_OPTIMIZATION_PERF`），不要改回默认 `-Og`。
 - **双板支持**：`components/bsp` 的引脚/分辨率按 `CONFIG_IDF_TARGET_ESP32` 区分 ESP32-C3(FoloToy-Card) 与 ESP32(M5StickC Plus)，改引脚看 `bsp_pins.h`。
 - **开机画面**：`main/splash.c` 借 `nes_video_scratch()` 逐带推 EMBED 的 splash.bin(整帧直推会因驱动现分配 DMA 中转缓冲失败而下半屏花屏,实测),停留 4s + 开屏音效(`music_play_once`),淡入淡出用背光 PWM;背光点亮由菜单第一帧触发(nes_video_menu_draw),勿在 app_main 提前拉背光。换图重跑 `gen_splash.py`,字节序是 MSB-first RGB565（与 nes_video.c 的 SWAP565 约定一致）。
-- **CRT 畸变**：菜单专用（`nes_video.c` 的 `MENU_CRT` 区块，置 0 可关）：逐行水平桶形内收 + 边角压暗，走行内重采样（输出行只采样源行），不跨片取数据所以不需要第二块整帧缓冲；每帧多 ~5ms，菜单整页重绘扛得住，游戏 blit 路径 30fps 加不动故不做。
 - **注释风格**：全项目中文注释、文件头一段说明设计意图，新代码保持一致。
 
 ## 改动验证清单
