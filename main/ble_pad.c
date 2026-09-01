@@ -120,6 +120,36 @@ static bool             s_have_lastpad;
 static SemaphoreHandle_t s_scan_done;   // 扫描结束(SCAN_SECONDS 到点或提前取消)
 static SemaphoreHandle_t s_dev_closed;  // 手柄断开(CLOSE 事件)
 
+// ---------------------------------------------------------------------------
+// BLE 看门狗:部分手柄(实测 IINE Phone 模式)会在 GATT 发现阶段触发 HCI 超时
+// (status=261 BLE_HS_ETIMEOUT),主机与控制器失联后整个 BLE 栈静默死亡 ——
+// 扫描无声停止、esp_hidh_dev_open 永不返回,应用层无任何回调可救。
+// 对策:监控任务发现"未连接 && BLE 超过 60s 无活动"即重启(约 6s 起完,
+// 手柄自动回连,用户几乎无感)。活动时间戳由扫描循环与 DISC 事件持续刷新;
+// 连接态不监控(正常游戏数小时不动也合法)。
+#define BLE_WDT_TIMEOUT_MS  60000
+static volatile uint32_t s_ble_activity_ms;   // 最近一次 BLE 活动的 uptime ms
+
+static void ble_wdt_feed(void) {
+    s_ble_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void ble_wdt_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (s_connected) continue;
+        uint32_t idle = (uint32_t)(esp_timer_get_time() / 1000) - s_ble_activity_ms;
+        if (idle > BLE_WDT_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "BLE %lus 无活动且未连接,判定栈挂死,重启自愈",
+                     (unsigned long)(idle / 1000));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
+    }
+}
+
+
 #define SCAN_SECONDS  10
 
 // 扫描候选:只记得分最高的一台,不定长列表,内存有界
@@ -156,6 +186,7 @@ static int score_candidate(uint16_t appearance, const char *name)
 
 static void handle_disc(const struct ble_gap_disc_desc *disc)
 {
+    ble_wdt_feed();   // 收到广播 = BLE 栈活着
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
         return;
@@ -377,6 +408,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
             s_connected = true;
             s_pad_bits = 0;
             s_cur_dev = param->open.dev;
+            ble_wdt_feed();
             ESP_LOGI(TAG, "已连接: %s", esp_hidh_dev_name_get(param->open.dev));
             if (s_cal_mode) printf("CALCONN 1\n");
             // 打印 report map(按键布局校准的关键参考;对不上时看它推偏移)
@@ -396,6 +428,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
         s_connected = false;
         s_pad_bits = 0;
         s_cur_dev = NULL;
+        ble_wdt_feed();   // 断开后时间戳从零起算,否则立刻误判挂死
         if (s_cal_mode) printf("CALCONN 0\n");
         esp_hidh_dev_free(param->close.dev);    // API 要求:CLOSE 事件里必须释放
         xSemaphoreGive(s_dev_closed);           // 唤醒 scan_task 重扫
@@ -424,7 +457,10 @@ static void start_scan(void)
 
     int rc = ble_gap_disc(own_addr_type, SCAN_SECONDS * 1000, &disc_params, gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "启动扫描失败: rc=%d", rc);
+        // 常见于上一轮发现过程没被正确收尾(BUSY):取消残留过程,下轮重试。
+        // 不取消的话 disc 会一直失败,扫描从此哑掉。
+        ESP_LOGE(TAG, "启动扫描失败: rc=%d,取消残留过程", rc);
+        ble_gap_disc_cancel();
     }
 }
 
@@ -441,6 +477,10 @@ static void scan_task(void *arg)
     for (;;) {
         s_best.valid = false;
         s_best.score = 0;
+        ble_wdt_feed();   // 每轮循环喂狗:open 阻塞超时/扫描死掉都会被看门狗抓到
+        // 防令牌漂移:DISC_COMPLETE 偶发多发一次(取消/超时竞争),计数累积后
+        // 会让后面的轮次瞬间"拿到假令牌",扫描实际还在跑就贸然去连接。
+        while (xSemaphoreTake(s_scan_done, 0) == pdTRUE) {}
         start_scan();
         // 扫描时长固定 30s,DISC_COMPLETE 会 give 信号量;加个超时兜底
         xSemaphoreTake(s_scan_done, pdMS_TO_TICKS((SCAN_SECONDS + 5) * 1000));
@@ -465,8 +505,24 @@ static void scan_task(void *arg)
                 }
             }
             if (dev != NULL) {
-                // 守着连接,断开后 CLOSE 事件 give 信号量,出去重扫
-                xSemaphoreTake(s_dev_closed, portMAX_DELAY);
+                // 守着连接,断开后出去重扫。
+                // 不能死等 s_dev_closed(portMAX_DELAY):断链若发生在 open 返回
+                // 之前,或 NimBLE 偶发不回调 CLOSE(实测:手柄配对中长按配对键
+                // 这类硬断链),任务在此永久阻塞,扫描从此静默挂死。改为双保险:
+                // 轮询 esp_hidh 状态位 + 在 GAP 层直接查链路是否还存在,任一
+                // 侧发现断开即退出。
+                ble_addr_t cur = { .type = s_best.addr_type };
+                memcpy(cur.val, s_best.addr, 6);
+                while (s_connected) {
+                    struct ble_gap_conn_desc desc;
+                    if (ble_gap_conn_find_by_addr(&cur, &desc) != 0) {
+                        ESP_LOGW(TAG, "GAP 层链路已消失(未收到 CLOSE 回调),继续重扫");
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+                // 消费可能残留/迟到的断开令牌,避免计数累积
+                xSemaphoreTake(s_dev_closed, 0);
                 vTaskDelay(pdMS_TO_TICKS(500));     // 断开后稍等再扫,避免狂转
             } else {
                 ESP_LOGW(TAG, "open 失败,删除该设备旧配对信息,2s 后重扫");
@@ -723,6 +779,7 @@ esp_err_t ble_pad_init(void)
     }
 
     xTaskCreate(scan_task, "ble_scan", 4096, NULL, 2, NULL);
+    xTaskCreate(ble_wdt_task, "ble_wdt", 3072, NULL, 1, NULL);
 
     // 校准任务:读串口命令(网页校准程序用)
     xTaskCreate(cal_task, "padcal", 4096, NULL, 3, NULL);
