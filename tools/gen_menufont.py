@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-# 菜单字库生成:字符集自动派生自 romlist.txt 的显示名 + 固定 UI 文案。
+# 菜单字库生成:字符集自动派生自 ROM 清单的显示名 + 固定 UI 文案。
 # 清单加游戏后重跑本脚本即可,显示名里的新字自动进字库。
+#
+#   用法: python3 tools/gen_menufont.py [清单路径]   # 默认 tools/romlist.txt
+#         私人清单(不入库): python3 tools/gen_menufont.py tools/romlist.local.txt
+#         注意:用私人清单生成后 main/menufont.h 会含私人游戏名,勿提交!
 import os, re, sys
 from PIL import Image, ImageFont, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIST = os.path.join(ROOT, "tools", "romlist.txt")
+LIST = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "tools", "romlist.txt")
 OUT = os.path.join(ROOT, "main", "menufont.h")
 
 UI_TEXT = "选择游戏游戏库OK键开始无小小游戏机"
