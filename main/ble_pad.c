@@ -266,6 +266,8 @@ static void handle_disc(const struct ble_gap_disc_desc *disc)
 // 手柄固件挂死,见文件头)。
 // ---------------------------------------------------------------------------
 #define BLE_PAD_WRITE_PROTO_MODE 0   // 实测 IINE 手柄该写操作会断数据流,关闭
+#define BLE_PAD_WRITE_OUTPUT    0   // 实测盲写输出报告会让 JZ-V4 手柄持续震动,关闭;
+                                    // 个别手柄若需 LED 写入才上报,置 1 单独验证
 static void gatt_disc_state_reset(void)
 {
     s_hid_start_handle = 0;
@@ -287,13 +289,16 @@ static int dsc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     (void)arg; (void)chr_val_handle;
     if (error->status != 0) {   // BLE_HS_EDONE:遍历结束
         ESP_LOGI(TAG, "订阅完成:共开启 %d 个输入报告通知", s_cccd_count);
-        // 输出报告(LED):部分手柄收到主机的 LED 写入后才开始上报
+#if BLE_PAD_WRITE_OUTPUT
+        // 输出报告(LED):部分手柄收到主机的 LED 写入后才开始上报。
+        // 注意:盲写输出报告会触发部分手柄震动电机(JZ-V4 实测),默认关闭。
         for (int i = 0; i < s_output_count; i++) {
             const uint8_t off = 0x00;
             int rc = ble_gattc_write_flat(conn_handle, s_output_handles[i],
                                           &off, 1, NULL, NULL);
             ESP_LOGI(TAG, "写输出报告 handle=%d rc=%d", s_output_handles[i], rc);
         }
+#endif
 #if BLE_PAD_WRITE_PROTO_MODE
         // HID 协议模式 = Report(0x01):不少手柄开机处于 Boot 模式且不发
         // input report,要主机写入后才正式开始上报。
