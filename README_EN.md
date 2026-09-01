@@ -32,11 +32,13 @@ idf.py build flash monitor
 
 The firmware ships with **no ROMs**. Games are read from a raw-partition ROM
 library in the storage partition (format: `main/rom_menu.h`, packer:
-`tools/rompack.py`).
+`tools/rompack.py`). **Drop your own games into the `roms/` folder** (its
+contents are git-ignored), then add a line `roms/yourgame.nes|Display Name`
+to `tools/romlist.txt`:
 
 ```bash
-# 1. The repo includes a zero-copyright test ROM; replace with your own legal ROMs
-python3 tools/gen_test_rom.py
+# 1. No games yet? Generate a zero-copyright test ROM
+python3 tools/gen_test_rom.py          # -> roms/test_rom.nes
 
 # 2. Edit tools/romlist.txt (one "path|display name" per line), then pack
 python3 tools/rompack.py -o rompack.bin -l tools/romlist.txt

@@ -27,8 +27,8 @@ idf.py set-target esp32c3      # 首次
 idf.py build                   # 构建验证(改代码后必跑)
 idf.py -p PORT flash monitor   # 烧录 + 看日志
 
-# ROM 库流程
-python3 tools/gen_test_rom.py                       # 生成零版权测试 ROM -> tools/test_rom.nes
+# ROM 库流程(游戏放进 roms/,该目录内容不入 git)
+python3 tools/gen_test_rom.py                                  # 生成零版权测试 ROM -> roms/test_rom.nes
 python3 tools/rompack.py -o rompack.bin -l tools/romlist.txt   # 打包
 python3 -m esptool --chip esp32c3 --port PORT write_flash 0x190000 rompack.bin
 
@@ -54,6 +54,7 @@ python3 tools/gen_splash.py     # 240x320 RGB565 位图 -> main/splash.bin(EMBED
 
 - [ ] `idf.py build` 通过（零 warning 新增为佳，nofrendo 老代码警告可忽略）
 - [ ] 改了 ROM 库格式 → 重新 `rompack.py` 打包烧录，实机菜单能列出游戏
+- [ ] 新增了 ROM 文件 → 确认它们只在 `roms/` 下且未被 git 跟踪(`git status` 干净)
 - [ ] 改了 `romlist.txt` 显示名 → `gen_menufont.py` 已重跑，菜单无豆腐块
 - [ ] 改了 BLE 手柄解析 → `tools/padcal.py` 校准后实机按键正常
 - [ ] 改了 `assets/splash_src.png` → `gen_splash.py` 已重跑，实机开机画面方向/色彩正常
@@ -65,6 +66,7 @@ python3 tools/gen_splash.py     # 240x320 RGB565 位图 -> main/splash.bin(EMBED
 ├── components/bsp/        # 板级支持包(MIT,可复用)
 ├── components/nofrendo/   # 模拟器内核(LGPL-2.0)
 ├── main/                  # 应用固件(MIT)
+├── roms/                  # 用户自备 ROM 目录(内容不入 git,只保留 README.md)
 ├── tools/                 # 开发工具(MIT,Python3)
 ├── assets/                # 美术源图(splash_src.png -> main/splash.bin)
 ├── partitions.csv         # 8MB flash:app 1.5MB + storage 5.4MB(ROM 库,0x190000 起)

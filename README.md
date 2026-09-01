@@ -31,11 +31,12 @@ idf.py build flash monitor
 ## ROM 库
 
 固件不含任何 ROM,游戏从 storage 分区的裸分区 ROM 库读取(格式见 `main/rom_menu.h`,
-打包器见 `tools/rompack.py`)。
+打包器见 `tools/rompack.py`)。**把你的游戏放进 `roms/` 目录**(内容不入 git),
+再在 `tools/romlist.txt` 里加一行 `roms/文件名.nes|显示名`:
 
 ```bash
-# 1. 仓库自带一个零版权测试 ROM,也可以换成自己的合法 ROM
-python3 tools/gen_test_rom.py
+# 1. roms/ 里没有游戏?生成一个零版权测试 ROM
+python3 tools/gen_test_rom.py          # -> roms/test_rom.nes
 
 # 2. 编辑 tools/romlist.txt(每行 "路径|显示名"),然后打包
 python3 tools/rompack.py -o rompack.bin -l tools/romlist.txt
@@ -70,7 +71,8 @@ python3 tools/padcal.py    # 浏览器打开 http://127.0.0.1:8788
 ├── components/
 │   ├── bsp/        # 板级支持包:SPI 屏/I2S 音频/ADC 按键/电量计(可复用到其他项目)
 │   └── nofrendo/   # NES 模拟器内核(LGPL-2.0, © 1998-2000 Matthew Conte)
-├── main/           # 固件:启动/ROM 库菜单/BLE 手柄/OSD 层/推屏/菜单 BGM
+├── main/           # 固件:启动/开机画面/ROM 库菜单/BLE 手柄/OSD 层/推屏/菜单 BGM
+├── roms/           # 把你的游戏放这里(内容不入 git,见 roms/README.md)
 ├── tools/
 │   ├── rompack.py       # ROM 库打包器(目录表 + 4KB 对齐裸分区镜像)
 │   ├── gen_menufont.py  # 菜单中文字库生成(按 romlist.txt 字符集)

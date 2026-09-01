@@ -12,6 +12,13 @@ dependencies.lock.bak
 # 例外:开机画面位图(tools/gen_splash.py 从 assets/splash_src.png 生成)
 !main/splash.bin
 
+# 用户自备 ROM 目录:内容永不入库(版权红线),只保留说明文件
+roms/*
+!roms/README.md
+
+# 私人 ROM 清单:自己的游戏列表,永不入库(版权红线)
+tools/romlist.local.txt
+
 # Python
 __pycache__/
 *.pyc

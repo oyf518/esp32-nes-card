@@ -1,35 +1,17 @@
 # ROM 库清单:每行 "路径|显示名"(路径相对仓库根,显示名最长 15 个汉字)
+# 把你的游戏放进 roms/ 目录(该目录内容不入 git),然后在下面加一行即可。
 # 改完执行:
-#   1) python3 nes/tools/gen_menufont.py    (字库自动跟随清单)
-#   2) cd nes && idf.py build flash         (字库在固件里)
-#   3) python3 nes/tools/rompack.py -o /tmp/rompack.bin -l nes/tools/romlist.txt
-#      python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodem13301 write_flash 0x190000 /tmp/rompack.bin
-games/已分类/角色类 - 超级马利兄弟.NES|超级马里奥兄弟
-games/已分类/冒险类 - 冒险岛3 中文版.nes|冒险岛3中文版
-games/已分类/角色类 - 魂斗罗1.nes|魂斗罗
-games/已分类/桌面类 - 坦克大战.nes|坦克大战
-games/已分类/角色类 - 松鼠大作战2.nes|松鼠大作战2
-games/已分类/角色类 - 双截龙.NES|双截龙
-games/已分类/角色类 - 雪人兄弟.NES|雪人兄弟
-games/已分类/角色类 - 赤影战士.NES|赤影战士
-games/已分类/角色类 - 洛克人2 dRwIlY之谜  .NES|洛克人2
-games/忍者龙剑传1.nes|忍者龙剑传1
-games/炸弹人1.nes|炸弹人1
-games/马戏团.nes|马戏团
-games/打气球.nes|打气球
-games/已分类/角色类 - 超级马里奥兄弟3.NES|超级马里奥兄弟3
-games/已分类/角色类 - 恶魔城.NES|恶魔城
-games/已分类/角色类 - 忍者龙剑传2.nes|忍者龙剑传2
-games/冒险岛1.nes|冒险岛1
-games/已分类/冒险类 - 冒险岛2 中文版.NES|冒险岛2
-games/已分类/射击类 - 沙罗曼蛇2.NES|沙罗曼蛇2
-games/兵蜂1.nes|兵蜂1
-games/三目童子_.NES|三目童子
-games/吞食天地2.nes|吞食天地2
-games/已分类/动作类 - 热血物语 中文版.nes|热血物语
-games/古巴战士(完整汉化版).nes|古巴战士
-games/已分类/其它类 - 马里奥兄弟.NES|马里奥兄弟
-games/吃豆.nes|吃豆
-games/已分类/其它类 - 敲冰块.NES|敲冰块
-games/气球大战.NES|气球大战
-games/已分类/射击类 - 大蜜蜂.NES|大蜜蜂
+#   1) python3 tools/gen_menufont.py    (字库自动跟随清单)
+#   2) cd esp32-nes-card && idf.py build flash   (字库在固件里)
+#   3) python3 tools/rompack.py -o rompack.bin -l tools/romlist.txt
+#      python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodemXXXX write_flash 0x190000 rompack.bin
+#
+# ROM 合法性自担:请使用自制 ROM、免费 homebrew,或你合法拥有实体卡带的转储。
+# 商业 ROM 不受保护地再分发是侵权,请勿把打包好的 rompack.bin 传到网上。
+#
+# 私人清单:不想改这份示例清单的话,也可以把列表写到 tools/romlist.local.txt
+# (已被 .gitignore 排除),打包/生成字库时把 -l 参数换成它即可,注意本地重新生成
+# menufont.h 后不要把私人游戏名提交上来。
+#
+# 下面这条是仓库自带的零版权测试 ROM(由 tools/gen_test_rom.py 生成):
+roms/test_rom.nes|测试卡

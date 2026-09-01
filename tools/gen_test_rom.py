@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # tools/gen_test_rom.py
-# 生成自制 NES 测试 ROM(无版权问题),可放进 ROM 库清单(tools/romlist.txt)打包,
-# 或用来验证固件菜单/加载链路。
+# 生成自制 NES 测试 ROM(无版权问题),放进 roms/ 目录后由 ROM 库清单
+# (tools/romlist.txt)打包,或用来验证固件菜单/加载链路。
 #
-#   用法: python3 tools/gen_test_rom.py [输出路径]   # 默认 tools/test_rom.nes
+#   用法: python3 tools/gen_test_rom.py [输出路径]   # 默认 roms/test_rom.nes
 #
 # 产物:NROM-128 iNES 文件 = 16 字节头 + 16KB PRG + 8KB CHR,mapper 0,垂直镜像,
 #       NMI/RESET/IRQ 向量在 $FFFA-$FFFF(即 16KB PRG 的尾部)。
@@ -562,7 +562,7 @@ def gen_chr():
 
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'test_rom.nes')
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'roms', 'test_rom.nes')
 
     prg = Assembler(ROM_SOURCE).assemble()
     chr_data = gen_chr()
