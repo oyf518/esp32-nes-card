@@ -1,10 +1,18 @@
 // main/ble_pad.c
-// BLE HID 游戏手柄支持:esp_hid host(BLE 模式)+ NimBLE,只当 central/observer。
+// BLE HID 游戏手柄支持:纯 NimBLE GAP/GATT 自实现 host(不用 esp_hidh),只当 central/observer。
+//
+// 不用 esp_hidh 的原因:它连接后必读 HID Report Map(ATT 长读),实测部分手柄
+// (IINE)固件在此步让自身链路层停止应答 -> C3 控制器 HCI 超时(BLE_HS_ETIMEOUT)
+// -> 整个 BLE 栈静默死亡。本文件的按键解析由 handle_input + s_layout 布局表
+// 独立完成,只需要原始 input report 字节流,因此绕开 esp_hidh:
+//   连接 -> 加密 -> 服务发现(0x1812) -> 给 input 特征值的 CCCD 写 0x0003 开通知,
+// 全程只做 Find Information / Read By Type 这类短交互,绝不长读 Report Map。
 //
 // 结构:
-//   ble_pad_init()   —— NVS + BT 控制器 + NimBLE + esp_hidh,起 scan_task
-//   scan_task        —— 循环:扫 30s -> 挑最佳候选 -> 连接 -> 等到断开 -> 重扫
-//   hidh_callback    —— esp_hidh 事件:OPEN(置已连接)/ INPUT(解析报告)/ CLOSE(清状态重扫)
+//   ble_pad_init()   —— NVS + BT 控制器 + NimBLE,起 scan_task
+//   scan_task        —— 循环:扫描 -> 挑最佳候选 -> ble_gap_connect -> 等到断开 -> 重扫
+//   gap_event_cb     —— GAP 事件:扫描 + CONNECT/ENC_CHANGE/NOTIFY_RX/DISCONNECT
+//   svc/chr/dsc_disc_cb —— GATT 服务发现链,订阅 HID input report 通知
 //   handle_input()   —— 按 s_layout 预设布局把 HID 报告解析成 NES 8 位位掩码
 //
 // 真机校准:不同手柄 HID 报告布局不同,内置预设不可能通吃。首次接手柄时
@@ -27,17 +35,19 @@
 #include "nvs.h"
 #include "esp_bt.h"
 
-#include "esp_hidh.h"
-#include "esp_hidh_nimble.h"        // esp_hidh_dev_open 的 NimBLE 版原型
+#include "esp_hid_common.h"         // ESP_HID_APPEARANCE_*(扫描候选打分用)
 
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
+#include "host/ble_gatt.h"
+#include "host/ble_hs_mbuf.h"       // ble_hs_mbuf_to_flat(notify 数据拷出)
 #include "host/ble_hs_adv.h"
 #include "host/ble_sm.h"
 #include "host/ble_store.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "esp_nimble_hci.h"         // esp_nimble_enable
+#include "nimble/ble.h"             // BLE_ERR_REM_USER_CONN_TERM(HCI 断开原因码)
 
 #include "ble_pad.h"
 
@@ -80,7 +90,7 @@ typedef struct {
 // 预设:通用 Android/D-input 手柄布局(8BitDo D-input 模式、廉价蓝牙手柄多见)
 //   byte0 = X 轴,byte1 = Y 轴(0~255 中值 128)
 //   byte4~5 = 16 个按钮位:btn1(南键)=bit0, btn2(东键)=bit1, ..., btn9/bit8=Select, btn10/bit9=Start
-// 注意:esp_hidh 的 INPUT 数据不含 report id 字节(HOGP 里 ID 由特征值隐式给出),
+// 注意:HOGP 的通知载荷不含 report id 字节(HOGP 里 ID 由特征值隐式给出),
 // 所以偏移从 0 起算。对不上就照 "RAW INPUT" 日志改本表。
 // 实测校准(JZ-V4 BFM,2025 抓包):
 //   byte1 = HAT(0x00上 02右 04下 06左 0F回中)
@@ -111,19 +121,32 @@ static volatile bool s_cal_mode;    // 校准模式:handle_input 额外输出 EV
 // ---------------------------------------------------------------------------
 // 运行状态
 // ---------------------------------------------------------------------------
-static volatile uint8_t s_pad_bits;     // 当前按键位掩码(事件任务写,emu 读)
+static volatile uint8_t s_pad_bits;     // 当前按键位掩码(GAP 回调写,emu 读)
 static volatile bool    s_connected;
-static esp_hidh_dev_t  *s_cur_dev;       // 当前连接的 HID 设备(优雅断开用)
+static uint16_t         s_conn_handle;   // 当前连接句柄(优雅断开用,配 s_connected)
+static uint8_t          s_own_addr_type; // 本机地址类型(start_scan 里推断,连接复用)
 static uint8_t          s_lastpad[6];    // 上次成功连接的手柄地址(快速重连)
 static bool             s_have_lastpad;
 
 static SemaphoreHandle_t s_scan_done;   // 扫描结束(SCAN_SECONDS 到点或提前取消)
-static SemaphoreHandle_t s_dev_closed;  // 手柄断开(CLOSE 事件)
+static SemaphoreHandle_t s_dev_closed;  // 手柄断开/连接失败(唤醒 scan_task)
+
+// GATT 发现进度(HID 0x1812 服务 -> input 特征值 -> CCCD),都在 NimBLE host
+// 任务回调里顺序推进,一次连接内只走一遍,用 static 传递中间结果即可
+static uint16_t s_hid_start_handle;     // HID 服务句柄范围
+static uint16_t s_hid_end_handle;
+static bool     s_hid_svc_found;        // 已找到 0x1812 服务
+static int      s_cccd_count;           // 已写入的 CCCD 数(订阅成功的输入报告数)
+static uint16_t s_proto_mode_handle;    // HID Protocol Mode 特征值(0x2A4E),0=未发现
+static uint16_t s_map_handle;           // Report Map 特征值(0x2A4B),0=未发现
+static int      s_input_chr_count;      // 发现的可通知输入特征值数
+static uint16_t s_output_handles[4];    // 输出报告特征值(LED 等,开机写一次解锁上报)
+static int      s_output_count;
 
 // ---------------------------------------------------------------------------
 // BLE 看门狗:部分手柄(实测 IINE Phone 模式)会在 GATT 发现阶段触发 HCI 超时
 // (status=261 BLE_HS_ETIMEOUT),主机与控制器失联后整个 BLE 栈静默死亡 ——
-// 扫描无声停止、esp_hidh_dev_open 永不返回,应用层无任何回调可救。
+// 扫描无声停止、连接流程永不收尾,应用层无任何回调可救。
 // 对策:监控任务发现"未连接 && BLE 超过 60s 无活动"即重启(约 6s 起完,
 // 手柄自动回连,用户几乎无感)。活动时间戳由扫描循环与 DISC 事件持续刷新;
 // 连接态不监控(正常游戏数小时不动也合法)。
@@ -148,7 +171,6 @@ static void ble_wdt_task(void *arg) {
         }
     }
 }
-
 
 #define SCAN_SECONDS  10
 
@@ -237,6 +259,158 @@ static void handle_disc(const struct ble_gap_disc_desc *disc)
     }
 }
 
+// ---------------------------------------------------------------------------
+// GATT 服务发现链(加密成功后,运行在 NimBLE host 任务上下文)。
+// 回调间用上面那组 static 变量传递进度,链式发起下一步发现。
+// 只做服务/特征值/描述符发现 + 写 CCCD,绝不读 Report Map 长读(会触发部分
+// 手柄固件挂死,见文件头)。
+// ---------------------------------------------------------------------------
+#define BLE_PAD_WRITE_PROTO_MODE 0   // 实测 IINE 手柄该写操作会断数据流,关闭
+static void gatt_disc_state_reset(void)
+{
+    s_hid_start_handle = 0;
+    s_hid_end_handle = 0;
+    s_hid_svc_found = false;
+    s_cccd_count = 0;
+    s_proto_mode_handle = 0;
+    s_map_handle = 0;
+    s_input_chr_count = 0;
+    s_output_count = 0;
+}
+
+// 描述符回调:给 HID 服务里所有 CCCD(0x2902)写 0x0003。发现范围覆盖整个
+// HID 服务,把 report / boot input 的 CCCD 一并打开——多写无害,手柄只在
+// 自己的报告通道上发通知。
+static int dsc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)arg; (void)chr_val_handle;
+    if (error->status != 0) {   // BLE_HS_EDONE:遍历结束
+        ESP_LOGI(TAG, "订阅完成:共开启 %d 个输入报告通知", s_cccd_count);
+        // 输出报告(LED):部分手柄收到主机的 LED 写入后才开始上报
+        for (int i = 0; i < s_output_count; i++) {
+            const uint8_t off = 0x00;
+            int rc = ble_gattc_write_flat(conn_handle, s_output_handles[i],
+                                          &off, 1, NULL, NULL);
+            ESP_LOGI(TAG, "写输出报告 handle=%d rc=%d", s_output_handles[i], rc);
+        }
+#if BLE_PAD_WRITE_PROTO_MODE
+        // HID 协议模式 = Report(0x01):不少手柄开机处于 Boot 模式且不发
+        // input report,要主机写入后才正式开始上报。
+        // 注意:实测 IINE Gamepad 模式下这一写会让手柄数据流当场停止
+        // (其固件对该写操作脆弱),故默认关闭,除非确认手柄需要。
+        if (s_proto_mode_handle != 0) {
+            const uint8_t report_mode = 0x01;
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(&report_mode, 1);
+            if (om != NULL) {
+                int rc = ble_gattc_write_no_rsp(conn_handle, s_proto_mode_handle, om);
+                ESP_LOGI(TAG, "写 Protocol Mode=Report handle=%d rc=%d",
+                         s_proto_mode_handle, rc);
+            }
+        }
+#endif
+        return 0;
+    }
+    if (dsc->uuid.u.type != BLE_UUID_TYPE_16 ||
+            ble_uuid_u16(&dsc->uuid.u) != BLE_GATT_DSC_CLT_CFG_UUID16) {
+        return 0;   // 只认 CCCD
+    }
+    static const uint8_t cccd_val[2] = {0x03, 0x00};    // 0x0003:notify + indicate
+    int rc = ble_gattc_write_flat(conn_handle, dsc->handle, cccd_val, sizeof(cccd_val),
+                                  NULL, NULL);
+    s_cccd_count++;
+    ESP_LOGI(TAG, "写 CCCD handle=%d rc=%d", dsc->handle, rc);
+    return 0;
+}
+
+// Report Map 安全读回调:只用普通 ATT_READ(单包,最多 MTU-3 字节),
+// 绝不发 ATT_READ_BLOB 长读 —— 长读会触发部分手柄固件链路层挂死(实测)。
+// 读它不为用内容(布局解析不用),而是很多手柄要见到"主机读过 map"才开始上报。
+static int map_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       struct ble_gatt_attr *attr, void *arg)
+{
+    (void)arg;
+    if (error->status == 0) {
+        uint8_t head[16];
+        uint16_t n = sizeof(head);
+        ble_hs_mbuf_to_flat(attr->om, head, sizeof(head), &n);
+        ESP_LOGI(TAG, "Report Map 普通读成功(仅取前 %u 字节): %02x%02x%02x%02x...",
+                 (unsigned)n, head[0], head[1],
+                 n > 2 ? head[2] : 0, n > 3 ? head[3] : 0);
+    } else {
+        ESP_LOGW(TAG, "Report Map 读失败 status=%d,继续订阅", error->status);
+    }
+    ble_gattc_disc_all_dscs(conn_handle, s_hid_start_handle, s_hid_end_handle,
+                            dsc_disc_cb, NULL);
+    return 0;
+}
+
+// 特征值回调:收集全部可通知特征值(HID input report)与 Protocol Mode(0x2A4E)。
+// 描述符发现必须等特征值遍历 EDONE 后再发起——NimBLE 同一时刻只允许一个
+// GATT 过程,中途另起会打断特征值遍历(实测只订阅到部分 CCCD)。
+static int chr_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)arg;
+    if (error->status != 0) {   // BLE_HS_EDONE:遍历结束
+        if (!s_hid_svc_found) return 0;
+        // 先安全读 Report Map(解锁部分手柄的上报),再进入 CCCD 订阅
+        if (s_map_handle != 0) {
+            ESP_LOGI(TAG, "普通读 Report Map handle=%d(不用长读)", s_map_handle);
+            ble_gattc_read(conn_handle, s_map_handle, map_read_cb, NULL);
+            return 0;
+        }
+        ESP_LOGI(TAG, "无 Report Map,直接发起描述符发现");
+        ble_gattc_disc_all_dscs(conn_handle, s_hid_start_handle, s_hid_end_handle,
+                                dsc_disc_cb, NULL);
+        return 0;
+    }
+    if (ble_uuid_u16(&chr->uuid.u) == 0x2A4B) {
+        s_map_handle = chr->val_handle;
+        ESP_LOGI(TAG, "Report Map 特征值 handle=%d", chr->val_handle);
+    }
+    if (chr->properties & (BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_INDICATE)) {
+        s_input_chr_count++;
+        ESP_LOGI(TAG, "输入特征值 val_handle=%d props=0x%02x",
+                 chr->val_handle, chr->properties);
+    }
+    if (ble_uuid_u16(&chr->uuid.u) == 0x2A4E) {
+        s_proto_mode_handle = chr->val_handle;
+        ESP_LOGI(TAG, "Protocol Mode 特征值 handle=%d", chr->val_handle);
+    }
+    if ((chr->properties & (BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP)) &&
+            s_output_count < 4) {
+        s_output_handles[s_output_count++] = chr->val_handle;
+        ESP_LOGI(TAG, "输出特征值 val_handle=%d props=0x%02x",
+                 chr->val_handle, chr->properties);
+    }
+    return 0;
+}
+
+// 服务回调:锁定 0x1812 的句柄范围,继续发现其下特征值
+static int svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       const struct ble_gatt_svc *service, void *arg)
+{
+    (void)arg;
+    if (error->status != 0) {
+        if (!s_hid_svc_found) {
+            ESP_LOGW(TAG, "对端无 HID 服务(0x1812)");
+        }
+        return 0;
+    }
+    if (ble_uuid_u16(&service->uuid.u) == HID_SVC_UUID) {
+        s_hid_svc_found = true;
+        s_hid_start_handle = service->start_handle;
+        s_hid_end_handle = service->end_handle;
+        ESP_LOGI(TAG, "HID 服务句柄范围 %d~%d", s_hid_start_handle, s_hid_end_handle);
+        ble_gattc_disc_all_chrs(conn_handle, s_hid_start_handle, s_hid_end_handle,
+                                chr_disc_cb, NULL);
+    }
+    return 0;
+}
+
+static void handle_input(uint16_t report_id, const uint8_t *data, uint16_t len);
+
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -247,6 +421,69 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC_COMPLETE:
         xSemaphoreGive(s_scan_done);
         break;
+    case BLE_GAP_EVENT_CONNECT: {
+        if (event->connect.status == 0) {
+            s_conn_handle = event->connect.conn_handle;
+            s_connected = true;
+            s_pad_bits = 0;
+            gatt_disc_state_reset();
+            ble_wdt_feed();
+            ESP_LOGI(TAG, "已连接 conn_handle=%d", s_conn_handle);
+            if (s_cal_mode) printf("CALCONN 1\n");
+            // HID 特征值要求加密链路,由本端发起配对/加密(已有 bond 则直接加密)
+            int rc = ble_gap_security_initiate(event->connect.conn_handle);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "发起加密失败 rc=%d,等待链路断开重扫", rc);
+            }
+        } else {
+            ESP_LOGW(TAG, "连接建立失败(status=%d),唤醒重扫", event->connect.status);
+            xSemaphoreGive(s_dev_closed);
+        }
+        break;
+    }
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        if (event->enc_change.status == 0) {
+            ESP_LOGI(TAG, "链路已加密,开始 GATT 服务发现");
+            ble_uuid16_t hid_uuid = BLE_UUID16_INIT(HID_SVC_UUID);
+            int rc = ble_gattc_disc_svc_by_uuid(event->enc_change.conn_handle, &hid_uuid.u,
+                                                svc_disc_cb, NULL);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "发起服务发现失败 rc=%d", rc);
+            }
+        } else {
+            ESP_LOGW(TAG, "加密失败 status=%d", event->enc_change.status);
+        }
+        break;
+    }
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        // 按键数据主通道:HID input report 的 notify/indicate 载荷。
+        // report id 在 HOGP 里由特征值隐式给出,载荷里没有,统一按 0 传
+        // (布局表 report_id=0xFF 通吃,EVT 行的 id 字段为 0)。
+        uint8_t buf[128];
+        uint16_t out_len = 0;
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buf, sizeof(buf), &out_len) == 0 &&
+                out_len > 0) {
+            handle_input(0, buf, out_len);
+        }
+        break;
+    }
+    case BLE_GAP_EVENT_DISCONNECT: {
+        ESP_LOGW(TAG, "已断开: %02x:%02x:%02x:%02x:%02x:%02x (reason=%d),重新扫描",
+                 event->disconnect.conn.peer_ota_addr.val[5],
+                 event->disconnect.conn.peer_ota_addr.val[4],
+                 event->disconnect.conn.peer_ota_addr.val[3],
+                 event->disconnect.conn.peer_ota_addr.val[2],
+                 event->disconnect.conn.peer_ota_addr.val[1],
+                 event->disconnect.conn.peer_ota_addr.val[0],
+                 event->disconnect.reason);
+        s_connected = false;
+        s_pad_bits = 0;
+        gatt_disc_state_reset();
+        ble_wdt_feed();   // 断开后时间戳从零起算,否则立刻误判挂死
+        if (s_cal_mode) printf("CALCONN 0\n");
+        xSemaphoreGive(s_dev_closed);           // 唤醒 scan_task 重扫
+        break;
+    }
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
         // 已有 bond 但对端要求重新配对:删旧 bond 重配,省事优先(同官方例程)
         struct ble_gap_conn_desc desc;
@@ -270,7 +507,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 }
 
 // ---------------------------------------------------------------------------
-// HID 报告解析(esp_hidh 事件任务上下文)
+// HID 报告解析(NimBLE host 任务上下文,做日志和解析可以,不能长时间阻塞)
 // ---------------------------------------------------------------------------
 static const char *bit_name(uint8_t bit)
 {
@@ -395,58 +632,13 @@ static void handle_input(uint16_t report_id, const uint8_t *data, uint16_t len)
 }
 
 // ---------------------------------------------------------------------------
-// esp_hidh 事件回调(事件任务上下文,做日志和解析可以,不能长时间阻塞)
-// ---------------------------------------------------------------------------
-static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
-{
-    (void)handler_args; (void)base;
-    esp_hidh_event_data_t *param = (esp_hidh_event_data_t *)event_data;
-
-    switch ((esp_hidh_event_t)id) {
-    case ESP_HIDH_OPEN_EVENT:
-        if (param->open.status == ESP_OK) {
-            s_connected = true;
-            s_pad_bits = 0;
-            s_cur_dev = param->open.dev;
-            ble_wdt_feed();
-            ESP_LOGI(TAG, "已连接: %s", esp_hidh_dev_name_get(param->open.dev));
-            if (s_cal_mode) printf("CALCONN 1\n");
-            // 打印 report map(按键布局校准的关键参考;对不上时看它推偏移)
-            esp_hidh_dev_dump(param->open.dev, stdout);
-        } else {
-            ESP_LOGW(TAG, "连接失败(status=%d),继续扫描", param->open.status);
-        }
-        break;
-    case ESP_HIDH_INPUT_EVENT:
-        handle_input(param->input.report_id, param->input.data, param->input.length);
-        break;
-    case ESP_HIDH_BATTERY_EVENT:
-        ESP_LOGI(TAG, "电量: %d%%", param->battery.level);
-        break;
-    case ESP_HIDH_CLOSE_EVENT:
-        ESP_LOGW(TAG, "已断开: %s,重新扫描", esp_hidh_dev_name_get(param->close.dev));
-        s_connected = false;
-        s_pad_bits = 0;
-        s_cur_dev = NULL;
-        ble_wdt_feed();   // 断开后时间戳从零起算,否则立刻误判挂死
-        if (s_cal_mode) printf("CALCONN 0\n");
-        esp_hidh_dev_free(param->close.dev);    // API 要求:CLOSE 事件里必须释放
-        xSemaphoreGive(s_dev_closed);           // 唤醒 scan_task 重扫
-        break;
-    default:
-        break;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 扫描任务:扫描 -> 连接 -> 守到断开 -> 重扫,全在本任务闭环,不阻塞 emu 任务
 // ---------------------------------------------------------------------------
 static void start_scan(void)
 {
-    uint8_t own_addr_type = 0;
     struct ble_gap_disc_params disc_params = {0};
 
-    if (ble_hs_id_infer_auto(0, &own_addr_type) != 0) {
+    if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) {
         ESP_LOGE(TAG, "无法确定本机地址类型");
         return;
     }
@@ -455,7 +647,7 @@ static void start_scan(void)
     disc_params.itvl = 0x50;
     disc_params.window = 0x30;
 
-    int rc = ble_gap_disc(own_addr_type, SCAN_SECONDS * 1000, &disc_params, gap_event_cb, NULL);
+    int rc = ble_gap_disc(s_own_addr_type, SCAN_SECONDS * 1000, &disc_params, gap_event_cb, NULL);
     if (rc != 0) {
         // 常见于上一轮发现过程没被正确收尾(BUSY):取消残留过程,下轮重试。
         // 不取消的话 disc 会一直失败,扫描从此哑掉。
@@ -468,7 +660,7 @@ static void scan_task(void *arg)
 {
     (void)arg;
 
-    // 等 NimBLE host 与控制器同步完(esp_hidh 注册的 sync_cb 置位)
+    // 等 NimBLE host 与控制器同步完
     while (!ble_hs_synced()) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -477,7 +669,7 @@ static void scan_task(void *arg)
     for (;;) {
         s_best.valid = false;
         s_best.score = 0;
-        ble_wdt_feed();   // 每轮循环喂狗:open 阻塞超时/扫描死掉都会被看门狗抓到
+        ble_wdt_feed();   // 每轮循环喂狗:连接卡死/扫描死掉都会被看门狗抓到
         // 防令牌漂移:DISC_COMPLETE 偶发多发一次(取消/超时竞争),计数累积后
         // 会让后面的轮次瞬间"拿到假令牌",扫描实际还在跑就贸然去连接。
         while (xSemaphoreTake(s_scan_done, 0) == pdTRUE) {}
@@ -487,10 +679,37 @@ static void scan_task(void *arg)
 
         if (s_best.valid) {
             ESP_LOGI(TAG, "连接手柄: '%s' APP=0x%04x", s_best.name, s_best.appearance);
-            // open 内部阻塞到 GATT 连接完成/失败(最长约 30s),在本任务跑无碍
-            esp_hidh_dev_t *dev = esp_hidh_dev_open(s_best.addr, ESP_HID_TRANSPORT_BLE, s_best.addr_type);
-            (void)dev;
+            ble_addr_t peer = { .type = s_best.addr_type };
+            memcpy(peer.val, s_best.addr, 6);
+            // 连接参数:30/50ms 间隔、无 latency、4s 监督超时,手柄通用
+            struct ble_gap_conn_params conn_params = {
+                .scan_itvl = 0x50,          // 连接期间回扫,与扫描参数一致
+                .scan_window = 0x30,
+                .itvl_min = 24,             // 30ms
+                .itvl_max = 40,             // 50ms
+                .latency = 0,
+                .supervision_timeout = 400, // 400 * 10ms = 4s
+                .min_ce_len = 0,
+                .max_ce_len = 0,
+            };
+            // 非阻塞发起;结果经 gap_event_cb 回报(成功置 s_connected,失败 give s_dev_closed)
+            int rc = ble_gap_connect(s_own_addr_type, &peer, 30000, &conn_params,
+                                     gap_event_cb, NULL);
+            if (rc != 0) {
+                // 常见于上一轮连接过程没收尾(BUSY):取消残留过程,下轮重试
+                ESP_LOGE(TAG, "发起连接失败: rc=%d,取消残留过程", rc);
+                ble_gap_conn_cancel();
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+            // 轮询等连接结果(控制器 30s 连接超时兜底,不会永久卡住)
+            int waited_ms = 0;
+            while (!s_connected && waited_ms < 32000 &&
+                   xSemaphoreTake(s_dev_closed, pdMS_TO_TICKS(200)) != pdTRUE) {
+                waited_ms += 200;
+            }
             if (s_connected) {
+                ble_wdt_feed();
                 // 记住本次手柄地址:下次重启/掉线后扫描一旦见到它,秒连
                 memcpy(s_lastpad, s_best.addr, 6);
                 s_have_lastpad = true;
@@ -503,20 +722,15 @@ static void scan_task(void *arg)
                     nvs_commit(h);
                     nvs_close(h);
                 }
-            }
-            if (dev != NULL) {
                 // 守着连接,断开后出去重扫。
-                // 不能死等 s_dev_closed(portMAX_DELAY):断链若发生在 open 返回
-                // 之前,或 NimBLE 偶发不回调 CLOSE(实测:手柄配对中长按配对键
-                // 这类硬断链),任务在此永久阻塞,扫描从此静默挂死。改为双保险:
-                // 轮询 esp_hidh 状态位 + 在 GAP 层直接查链路是否还存在,任一
-                // 侧发现断开即退出。
-                ble_addr_t cur = { .type = s_best.addr_type };
-                memcpy(cur.val, s_best.addr, 6);
+                // 不能死等 s_dev_closed(portMAX_DELAY):NimBLE 偶发不回调
+                // DISCONNECT(实测:手柄配对中长按配对键这类硬断链),任务会
+                // 在此永久阻塞,扫描从此静默挂死。改为在 GAP 层轮询链路是否
+                // 还存在,任一侧发现断开即退出。
                 while (s_connected) {
                     struct ble_gap_conn_desc desc;
-                    if (ble_gap_conn_find_by_addr(&cur, &desc) != 0) {
-                        ESP_LOGW(TAG, "GAP 层链路已消失(未收到 CLOSE 回调),继续重扫");
+                    if (ble_gap_conn_find(s_conn_handle, &desc) != 0) {
+                        ESP_LOGW(TAG, "GAP 层链路已消失(未收到断开回调),继续重扫");
                         break;
                     }
                     vTaskDelay(pdMS_TO_TICKS(500));
@@ -525,7 +739,7 @@ static void scan_task(void *arg)
                 xSemaphoreTake(s_dev_closed, 0);
                 vTaskDelay(pdMS_TO_TICKS(500));     // 断开后稍等再扫,避免狂转
             } else {
-                ESP_LOGW(TAG, "open 失败,删除该设备旧配对信息,2s 后重扫");
+                ESP_LOGW(TAG, "连接失败,删除该设备旧配对信息,2s 后重扫");
                 // 陈旧 bond 会让对端拿旧密钥来加密,必然失败 -> 每轮都连不上。
                 // 删掉本端保存的这台设备配对信息,下一轮强制重新配对。
                 ble_addr_t stale = { .type = s_best.addr_type };
@@ -683,11 +897,10 @@ static void cal_task(void *arg)
 void ble_pad_graceful_reboot(void)
 {
     // 先给手柄一个正常的 HCI 断开事件(直接 esp_restart 会让手柄状态机
-    // 卡在"已连接",不再响应重连),等 CLOSE 事件收尾后再重启。
-    esp_hidh_dev_t *dev = s_cur_dev;
-    if (dev != NULL) {
+    // 卡在"已连接",不再响应重连),等断开事件收尾后再重启。
+    if (s_connected) {
         ESP_LOGW(TAG, "优雅断开手柄后重启");
-        esp_hidh_dev_close(dev);
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         xSemaphoreTake(s_dev_closed, pdMS_TO_TICKS(600));
         vTaskDelay(pdMS_TO_TICKS(200));   // 给手柄留出处理断开的时间
     }
@@ -741,14 +954,6 @@ esp_err_t ble_pad_init(void)
     ret = esp_nimble_init();
     ESP_RETURN_ON_ERROR(ret, TAG, "esp_nimble_init 失败");
 
-    esp_hidh_config_t config = {
-        .callback = hidh_callback,
-        .event_stack_size = 4096,
-        .callback_arg = NULL,
-    };
-    ret = esp_hidh_init(&config);
-    ESP_RETURN_ON_ERROR(ret, TAG, "esp_hidh_init 失败");
-
     // SMP:启用 bonding(配对信息存 NVS),无屏无键盘 -> NoInputNoOutput,
     // 对端发起配对时走 Just Works;重复配对直接删旧 bond(见 gap_event_cb)
     ble_hs_cfg.sm_bonding = 1;
@@ -763,7 +968,7 @@ esp_err_t ble_pad_init(void)
     ret = esp_nimble_enable(nimble_host_task);
     ESP_RETURN_ON_ERROR(ret, TAG, "esp_nimble_enable 失败");
 
-    // 扫描任务:优先级低于 emu(5),栈留足给 esp_hidh_dev_open 的阻塞等待
+    // 扫描任务:优先级低于 emu(5),栈留足给 GATT 服务发现回调链
     // 读上次成功连接的手柄地址(快速重连:扫描一见到它就提前收网)
     nvs_handle_t h;
     if (nvs_open("nes", NVS_READONLY, &h) == ESP_OK) {
