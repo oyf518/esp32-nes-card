@@ -48,7 +48,7 @@ python3 tools/gen_splash.py     # 240x320 RGB565 位图 -> main/splash.bin(EMBED
 - **编译优化**：模拟器 CPU 密集，全局 `-O2`（`sdkconfig.defaults` 的 `CONFIG_COMPILER_OPTIMIZATION_PERF`），不要改回默认 `-Og`。
 - **双板支持**：`components/bsp` 的引脚/分辨率按 `CONFIG_IDF_TARGET_ESP32` 区分 ESP32-C3(FoloToy-Card) 与 ESP32(M5StickC Plus)，改引脚看 `bsp_pins.h`。
 - **开机画面**：`main/splash.c` 借 `nes_video_scratch()` 逐带推 EMBED 的 splash.bin(整帧直推会因驱动现分配 DMA 中转缓冲失败而下半屏花屏,实测),停留 4s + 开屏音效(`music_play_once`),淡入淡出用背光 PWM;背光点亮由菜单第一帧触发(nes_video_menu_draw),勿在 app_main 提前拉背光。换图重跑 `gen_splash.py`,字节序是 MSB-first RGB565（与 nes_video.c 的 SWAP565 约定一致）。
-- **BLE 手柄兼容性**：廉价克隆手柄固件质量参差。实测 IINE 手柄（Gamepad/Phone 模式）固件有致命 bug：对 Report Map 的 ATT_READ_BLOB 长读、写 Protocol Mode 都会令其链路层静默挂死；已绕开长读，但该手柄仍不上报按键，判定不兼容。预设布局来自实测过的 JZ-V4 BFM。新手柄接不上的排查顺序：串口看"发现 HID 设备"行有无广播 → 连接后看加密/GATT 链路日志 → 用 tools/padcal.py 校准布局。
+- **BLE 手柄兼容性**：廉价克隆手柄固件质量参差。实测 IINE 手柄（Gamepad/Phone 模式）固件有致命 bug：对 Report Map 的 ATT_READ_BLOB 长读、写 Protocol Mode 都会令其链路层静默挂死；已绕开长读，但该手柄仍不上报按键，判定不兼容。**盲写输出报告（含 LED）会让 JZ-V4 手柄持续震动**，故输出写入默认关闭（`BLE_PAD_WRITE_OUTPUT`）。预设布局来自实测过的 JZ-V4 BFM。新手柄接不上的排查顺序：串口看"发现 HID 设备"行有无广播 → 连接后看加密/GATT 链路日志 → 用 tools/padcal.py 校准布局。
 - **BLE 连接层（已重写，不用 esp_hidh）**：连接 → `ble_gap_security_initiate`（HID 特征值要加密）→ 发现 0x1812 服务 → 普通 ATT_READ 读 Report Map（**绝不能发长读**，会挂死部分手柄）→ 订阅全部 CCCD。按键数据走 `BLE_GAP_EVENT_NOTIFY_RX` → handle_input，布局解析不变。
 - **BLE 看门狗**：`ble_wdt_task` 监控"未连接 && 60s 无 BLE 活动"→ 自动重启自愈。部分手柄会触发 HCI 超时（NimBLE status=261）把整个 BLE 栈打静默，应用层无回调可救，只能重启；扫描任务里同时修了信号量漂移与 CLOSE 回调丢失导致的永久阻塞。
 - **注释风格**：全项目中文注释、文件头一段说明设计意图，新代码保持一致。
