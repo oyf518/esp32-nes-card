@@ -393,8 +393,7 @@ static void draw_ble(uint16_t *fb, int slice) {
 }
 
 // 状态栏:电池图标(壳 + 电极 + 按电量填充;读不到画空壳)
-static void draw_battery(uint16_t *fb, int slice, int soc) {
-    const int x0 = 208, y0 = 18;     // 壳 20x11,电极 2x5
+static void draw_battery(uint16_t *fb, int slice, int soc) {    const int x0 = 208, y0 = 18;     // 壳 20x11,电极 2x5
     for (int x = x0; x < x0 + 20; x++) {
         mput(fb, slice, y0, x, COL_ICON);
         mput(fb, slice, y0 + 10, x, COL_ICON);
@@ -415,9 +414,70 @@ static void draw_battery(uint16_t *fb, int slice, int soc) {
             mput(fb, slice, y, x, c);
 }
 
+// ---------------------------------------------------------------------------
+// CRT 畸变(菜单专用):桶形内收 + 边角压暗,模拟凸面玻璃屏。
+// 只做水平分量:输出行 y 仅重采样源行 y,逐行独立 —— 适配半帧缓冲的分片
+// 推屏,不需要第二块整帧源缓冲(C3 SRAM 放不下 150KB)。垂直方向的弯曲
+// 需要 2D 逐像素逆映射(跨片取源行),不做。效果:竖直的卡片边缘随行高
+// 远离屏幕中线逐渐内收,状态栏分隔线/进度条两端向上翘起,四角轻微压暗。
+// 菜单是整页重绘(~30fps,受推屏 DMA 限速),逐像素变换每帧多花 ~5ms,
+// 游戏画面(blit 路径 30fps)加不动,不做。
+#define MENU_CRT       1     // 0 = 关闭畸变,直出平面画面
+#define CRT_BOW_Q12    369   // 顶部/底部行水平拉伸 Q12 增量(369/4096 ≈ 9%)
+#define CRT_DIM_ROW    56    // 上下边缘压暗幅度 Q8(56/256 ≈ 22%)
+#define CRT_DIM_COL    40    // 左右边缘压暗幅度 Q8(40/256 ≈ 16%)
+
+#if MENU_CRT
+static int     s_crt_h[320];            // 每行水平采样拉伸因子 Q12
+static uint8_t s_crt_dimr[320];         // 每行压暗系数 Q8(行分量,上下边缘)
+static uint8_t s_crt_dimc[NES_FB_W];    // 每列压暗系数 Q8(列分量,左右边缘)
+static uint16_t s_crt_tmp[NES_FB_W];    // 行重采样暂存(480B)
+
+static bool s_crt_ready;
+
+static void menu_crt_init(void) {
+    for (int y = 0; y < MENU_LCD_H; y++) {
+        int v = y * 2 - (MENU_LCD_H - 1);            // -319..319
+        int v2 = (v * v) / ((MENU_LCD_H - 1) * (MENU_LCD_H - 1) / 256);   // ≈(v/319)^2*256
+        if (v2 > 256) v2 = 256;
+        s_crt_h[y]    = 4096 + CRT_BOW_Q12 * v2 / 256;
+        s_crt_dimr[y] = 256 - CRT_DIM_ROW * v2 / 256;
+    }
+    for (int x = 0; x < NES_FB_W; x++) {
+        int u = x * 2 - (NES_FB_W - 1);              // -239..239
+        int u2 = (u * u) / ((NES_FB_W - 1) * (NES_FB_W - 1) / 256);
+        if (u2 > 256) u2 = 256;
+        s_crt_dimc[x] = 256 - CRT_DIM_COL * u2 / 256;
+    }
+}
+
+// 就地变换一行:水平桶形重采样(越靠上下边收得越多,越界处钳位复制边缘像素,
+// 背景是纯色所以 smear 不可见)+ 边角压暗。颜色是预交换字节序的 RGB565,
+// 按通道缩放前先换回正常序,算完再换回去。
+static void menu_crt_row(int y, uint16_t *row) {
+    if (!s_crt_ready) {
+        s_crt_ready = true;
+        menu_crt_init();
+    }
+    const int hfp = s_crt_h[y];
+    const int dimr = s_crt_dimr[y];
+    for (int x = 0; x < NES_FB_W; x++) {
+        int sx = 120 + ((x - 120) * hfp >> 12);
+        if (sx < 0) sx = 0; else if (sx > NES_FB_W - 1) sx = NES_FB_W - 1;
+        uint16_t c = (row[sx] >> 8) | (row[sx] << 8);          // 换回正常序
+        int d = dimr * s_crt_dimc[x] >> 8;                     // 0..256
+        uint16_t r = ((c >> 11) & 31) * d >> 8;
+        uint16_t g = ((c >> 5) & 63) * d >> 8;
+        uint16_t b = (c & 31) * d >> 8;
+        c = (r << 11) | (g << 5) | b;
+        s_crt_tmp[x] = (c >> 8) | (c << 8);                    // 换回显示序
+    }
+    memcpy(row, s_crt_tmp, sizeof(s_crt_tmp));
+}
+#endif   // MENU_CRT
+
 // 菜单全屏绘制过上下边区;进游戏前调本函数把 y<40 / y>=280 清回黑色。
-void nes_video_clear_edges(void) {
-    memset(s_fb, 0, sizeof(s_fb));
+void nes_video_clear_edges(void) {    memset(s_fb, 0, sizeof(s_fb));
     if (wait_trans_done())
         esp_lcd_panel_draw_bitmap(s_panel, 0, 0, NES_FB_W, NES_LCD_Y, s_fb);
     if (wait_trans_done())
@@ -513,6 +573,13 @@ void nes_video_menu_draw(const char *const *names, int count, int sel) {
         for (int y = MENU_PROG_Y; y < MENU_PROG_Y + 3; y++)
             for (int x = 10; x < NES_FB_W - 10; x++)
                 mput(fb, slice, y, x, x - 10 < pw ? COL_ACCENT : COL_PROG_TK);
+
+#if MENU_CRT
+        // CRT 畸变后处理:逐行水平内收 + 边角压暗(见 MENU_CRT 区块注释)
+        for (int y = 0; y < rows; y++) {
+            menu_crt_row(y0 + y, &fb[y * NES_FB_W]);
+        }
+#endif
 
         if (esp_lcd_panel_draw_bitmap(s_panel, 0, y0, NES_FB_W, y0 + rows,
                                       fb) != ESP_OK) {
