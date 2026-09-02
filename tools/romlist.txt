@@ -13,5 +13,6 @@
 # (已被 .gitignore 排除),打包/生成字库时把 -l 参数换成它即可,注意本地重新生成
 # menufont.h 后不要把私人游戏名提交上来。
 #
-# 下面这条是仓库自带的零版权测试 ROM(由 tools/gen_test_rom.py 生成):
+# 下面这些是仓库自带的零版权 demo ROM(tools/gen_test_rom.py / gen_catch_rom.py 生成):
 roms/test_rom.nes|测试卡
+roms/catch.nes|接宝石
